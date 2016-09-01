@@ -5,4 +5,4 @@ Trains a word-level language model on a text file using an LSTM or GRU. Once the
 
 Using NCE greatly improves efficiency for word-level language models where the large vocabulary size makes computing softmax inefficient. 
 
-NCE is only used during the training of the model - a full softmax is used in evaluation.
+NCE can only be used during the training of the model as it describes a loss function, not a way of outputting predictions. A full softmax is used for generating samples.
