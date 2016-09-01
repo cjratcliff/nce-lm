@@ -168,7 +168,7 @@ def preprocess_string(s):
 def main():
 	# Load the corpus - 1.69m words
 	print "Loading corpus..."
-	corpus = open('wiki_all.txt','r').read()
+	corpus = open('tiny-shakespeare.txt','r').read()
 	print "Processing corpus..."
 	corpus = preprocess_string(corpus)
 	
