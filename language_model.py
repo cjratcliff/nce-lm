@@ -4,7 +4,6 @@ import numpy as np
 import theano
 import theano.tensor as T
 import lasagne
-from lasagne.utils import floatX
 import lasagne.layers as L
 
 import pickle
@@ -12,16 +11,18 @@ import random
 import string
 from collections import Counter
 
+# Based on https://github.com/ebenolson/pydata2015/blob/master/4%20-%20Recurrent%20Networks/RNN%20Character%20Model%20-%202%20Layer.ipynb
+
 # Options
 seq_length = 50
-batch_size = 16
+batch_size = 32
 max_iterations = 20000
-rnn_size = 128
+rnn_size = 512
+dropout_prob = 0.1
+# Defines two layers
 primer_length = 10 # Words
 vocab_size = 10000 # 9999 and an unknown word token
-GRU = True # Else LSTM
 
-NCE = True
 K = 10
 Z = pow(np.e,9)
 
@@ -29,10 +30,11 @@ Z = pow(np.e,9)
 clip_gradients = True
 max_grad_norm = 15
 
-summary_freq = 100
+summary_freq = 10
+val_freq = 50
 load_model = False
-save_model = False
-model_path = 'models/rnn_trained19750.pkl'
+save_model = True # Save the parameters and vocabulary
+model_path = 'models/rnn.pkl'
 
 
 class NCELayer(L.DenseLayer):
@@ -128,25 +130,18 @@ def build_rnn(x_sym, hid_init_sym, hid2_init_sym, seq_length, vocab_size, rnn_si
 	
 	l_input = L.EmbeddingLayer(l_input, input_size=vocab_size, output_size=rnn_size)
 
-	if GRU:
-		l_rnn = L.GRULayer(l_input, num_units=rnn_size, grad_clipping=5.0, hid_init=l_input_hid)
-		l_rnn2 = L.GRULayer(l_rnn, num_units=rnn_size, grad_clipping=5.0, hid_init=l_input_hid2)
-	else:
-		l_rnn = L.LSTMLayer(l_input, num_units=rnn_size, hid_init=l_input_hid)#, cell_init=l_init_cell)
-		l_rnn2 = L.LSTMLayer(l_rnn, num_units=rnn_size, hid_init=l_input_hid2)#, cell_init=l_init_cell2)
+	l_rnn = L.LSTMLayer(l_input, num_units=rnn_size, hid_init=l_input_hid)#, cell_init=l_init_cell)
+	h = L.DropoutLayer(l_rnn,p=dropout_prob)
+	l_rnn2 = L.LSTMLayer(h, num_units=rnn_size, hid_init=l_input_hid2)#, cell_init=l_init_cell2)
+	h = L.DropoutLayer(l_rnn2,p=dropout_prob)
 
 	# Before the decoder layer, we need to reshape the sequence into the batch dimension,
 	# so that timesteps are decoded independently.
-	l_shp = L.ReshapeLayer(l_rnn2, (-1, rnn_size))
+	l_shp = L.ReshapeLayer(h, (-1, rnn_size))
 	
-	if NCE:
-		pred = NCELayer(l_shp, num_units=vocab_size, Z=Z)
-		pred = L.ReshapeLayer(pred, (-1, seq_length, vocab_size))
-		return l_rnn, l_rnn2, pred
-	else:
-	    pred = L.DenseLayer(l_shp, num_units=vocab_size, nonlinearity=lasagne.nonlinearities.softmax)
-	    pred = L.ReshapeLayer(pred, (-1, seq_length, vocab_size))
-	    return l_rnn, l_rnn2, pred
+	pred = NCELayer(l_shp, num_units=vocab_size, Z=Z)
+	pred = L.ReshapeLayer(pred, (-1, seq_length, vocab_size))
+	return l_rnn, l_rnn2, pred
 	
 	
 def preprocess_string(s):
@@ -163,6 +158,13 @@ def preprocess_string(s):
 	# Remove zero-length strings
 	X = [i for i in X if i != '']
 	return X
+
+
+def create_indices(n,m):
+	indices = np.arange(n,dtype='int32')
+	indices = np.stack([indices for i in range(m)],axis=1)
+	indices = np.ndarray.flatten(indices)
+	return indices	
 	
 	
 def main():
@@ -209,63 +211,45 @@ def main():
 	p_rnn = T.scalar()
 	noise_word_indices = T.ivector()
 	batch_indices = T.ivector()
-	i1 = T.ivector()
 	
 	print "Building model..."
 	l_rnn, l_rnn2, l_out = build_rnn(x_sym, hid_init_sym, hid2_init_sym, seq_length, vocab_size, rnn_size)
 	
 	# We extract the hidden state of each RNN layer as well as the output of the decoder.
 	# Only the hidden state at the last timestep is needed
-	if NCE:
-		hid_out, hid2_out, prob_out = L.get_output([l_rnn, l_rnn2, l_out])
-	else:
-		hid_out, hid2_out, prob_out = L.get_output([l_rnn, l_rnn2, l_out])
+	hid_out, hid2_out, prob_out = L.get_output([l_rnn, l_rnn2, l_out])
 
 	hid_out = hid_out[:,-1]
 	hid2_out = hid2_out[:,-1]
 
-	if NCE:	
-		batch_indices = np.arange(batch_size,dtype='int32')
-		batch_indices = np.stack([batch_indices for i in range(seq_length)],axis=1)
-		batch_indices = np.ndarray.flatten(batch_indices)
-		
-		seq_indices = np.arange(seq_length,dtype='int32')
-		seq_indices = np.stack([seq_indices for i in range(batch_size)],axis=1)
-		seq_indices = np.ndarray.flatten(seq_indices)	
+	batch_indices = create_indices(batch_size,seq_length)
+	seq_indices = create_indices(seq_length,batch_size)	
+
+	p_rnn = prob_out[batch_indices,seq_indices,T.flatten(y_sym)] # (batch_size)
+	p_rnn = T.reshape(p_rnn,(batch_size,seq_length))
+
+	pn = noise_dist.dist_np[T.flatten(y_sym)]
+	pn = T.reshape(pn,(batch_size,seq_length))
+	pcrnn = p_rnn/(p_rnn + K*pn) # (batch_size)
 	
-		p_rnn = prob_out[batch_indices,seq_indices,T.flatten(y_sym)] # (batch_size)
-		p_rnn = T.reshape(p_rnn,(batch_size,seq_length))
+	batch_indices = create_indices(batch_size, seq_length*K)
+	seq_indices = create_indices(seq_length, batch_size*K)
+	
+	noise_sample = noise_dist.sample(batch_size*seq_length*K)
+	p_n_wij = np.array(noise_sample[0],dtype='float32') # (batch_size*K)
+	p_n_wij = T.reshape(p_n_wij, (batch_size,seq_length,K))
+	noise_word_indices = np.array(noise_sample[1],dtype='int32') # (batch_size*K)
+	p_n_wij *= K
+	
+	p_nce_wij = prob_out[batch_indices,seq_indices,noise_word_indices]
+	p_nce_wij = T.reshape(p_nce_wij,(batch_size,seq_length,K))
 
-		pn = noise_dist.dist_np[T.flatten(y_sym)]
-		pn = T.reshape(pn,(batch_size,seq_length))
-		pcrnn = p_rnn/(p_rnn + K*pn) # (batch_size)
-		
-		batch_indices = np.arange(batch_size,dtype='int32')
-		batch_indices = np.stack([batch_indices for i in range(seq_length*K)],axis=1)
-		batch_indices = np.ndarray.flatten(batch_indices)
-		
-		seq_indices = np.arange(seq_length,dtype='int32')
-		seq_indices = np.stack([seq_indices for i in range(batch_size*K)],axis=1)
-		seq_indices = np.ndarray.flatten(seq_indices)
-		
-		noise_sample = noise_dist.sample(batch_size*seq_length*K)
-		p_n_wij = np.array(noise_sample[0],dtype='float32') # (batch_size*K)
-		p_n_wij = T.reshape(p_n_wij, (batch_size,seq_length,K))
-		noise_word_indices = np.array(noise_sample[1],dtype='int32') # (batch_size*K)
-		p_n_wij *= K
-		
-		p_nce_wij = prob_out[batch_indices,seq_indices,noise_word_indices]
-		p_nce_wij = T.reshape(p_nce_wij,(batch_size,seq_length,K))
-
-		pcn_list = p_n_wij/(p_nce_wij + p_n_wij) # (batch_size,K)
-		
-		loss = -(T.log(pcrnn) + T.sum(T.log(pcn_list),axis=(2)))
-		loss = T.mean(loss)
-	else:
-		loss = T.mean(calc_cross_ent(prob_out, y_sym, vocab_size))
+	pcn_list = p_n_wij/(p_nce_wij + p_n_wij) # (batch_size,K)
+	
+	loss = -(T.log(pcrnn) + T.sum(T.log(pcn_list),axis=(2)))
+	loss = T.mean(loss)
 
 	all_params = L.get_all_params(l_out, trainable=True)
-
 	all_grads = T.grad(loss, all_params)
 	
 	if clip_gradients:
@@ -284,6 +268,7 @@ def main():
 
 	# Each iteration is a random sub-sequence of seq_length words
 	train_batch_gen = data_batch_generator(train_corpus)
+	val_batch_gen = data_batch_generator(val_corpus)
 	
 	# Load pre-trained weights into network
 	if load_model:
@@ -291,37 +276,35 @@ def main():
 		d = pickle.load(open(model_path, 'r'))
 		L.set_all_param_values(l_out, d['param values'])
 
+	train_losses = []
 	for iteration in range(max_iterations):
 		x, y = prep_batch_for_network(next(train_batch_gen), vocabulary, vocab_size, seq_length)
-		loss_train, hid, hid2 = train_fn(x, y, hid, hid2)
-		print iteration, loss_train
-		if iteration % summary_freq == 0:# and iteration > 0:
-			print 'Iteration {}, loss_train: {}'.format(iteration, loss_train)
+		loss_train,_,_ = train_fn(x, y, hid, hid2) ### Update the hidden states
+		train_losses.append(loss_train)
+
+		if iteration % summary_freq == 0:
+			print 'Iteration {}\tTraining loss: {}'.format(iteration, np.mean(train_losses))
+			train_losses = []
 			
+		if iteration % val_freq == 0 and iteration > 0:
+			x, y = prep_batch_for_network(next(val_batch_gen), vocabulary, vocab_size, seq_length)
+			loss_val,_,_ = val_fn(x, y, hid, hid2)
+			print '\t\tValidation loss: {}'.format(loss_val)
+
 			param_values = L.get_all_param_values(l_out)
 			d = {'param values': param_values,
 				 'vocabulary': vocabulary, 
 				}
 			
 			if save_model:
-				path = "models/rnn_trained%d.pkl" % iteration
-				pickle.dump(d, open(path ,'w'), protocol=pickle.HIGHEST_PROTOCOL)
+				path = "models/rnn_trained.pkl"
+				pickle.dump(d, open(path,'w'), protocol=pickle.HIGHEST_PROTOCOL)
 
 	predict_fn = theano.function([x_sym, hid_init_sym, hid2_init_sym], [prob_out, hid_out, hid2_out])
 
 	# Calculate validation loss
 	hid = np.zeros((batch_size, rnn_size), dtype='float32')
 	hid2 = np.zeros((batch_size, rnn_size), dtype='float32')
-
-	val_batch_gen = data_batch_generator(val_corpus)
-
-	losses = []
-
-	for iteration in range(50):
-		x, y = prep_batch_for_network(next(train_batch_gen), vocabulary, vocab_size, seq_length)
-		loss_val, hid, hid2 = val_fn(x, y, hid, hid2)
-		losses.append(loss_val)
-	print np.mean(losses)
 
 	# For faster sampling, we rebuild the network with a sequence length of 1
 	l_rnn, l_rnn2, l_out = build_rnn(x_sym, hid_init_sym, hid2_init_sym, 1, vocab_size, rnn_size)
@@ -360,12 +343,11 @@ def main():
 		p, hid, hid2 = predict_fn(x, hid, hid2)
 		p = p/(1 + 1e-6)
 		
-		if NCE:
-			# Normalize probabilities
-			p /= np.sum(p)
+		# Normalize probabilities
+		p /= np.sum(p)
 		
 		# Draw a sample from the multinomial distribution
-		s = np.random.multinomial(1, p)
+		s = np.random.multinomial(1,p)
 		str += inv_vocabulary[s.argmax(-1)] + ' '
 		x[0,0] = s.argmax(-1)
 			
